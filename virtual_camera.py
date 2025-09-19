@@ -16,6 +16,9 @@ import os
 import ssl
 import socket
 import ipaddress
+import base64
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -32,6 +35,144 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
     daemon_threads = True
     allow_reuse_address = True
+
+
+class AuthenticationManager:
+    """Manages HTTP authentication for the virtual camera server."""
+    
+    def __init__(self, auth_type=None, username="username", password="password"):
+        """
+        Initialize authentication manager.
+        
+        Args:
+            auth_type: Type of authentication ('basic', 'digest', or None)
+            username: Username for authentication (default: 'username')
+            password: Password for authentication (default: 'password')
+        """
+        self.auth_type = auth_type
+        self.username = username
+        self.password = password
+        self.realm = "Virtual Security Camera"
+        self.nonce_store = {}  # For digest auth nonce tracking
+        self.current_nonce = None  # Store the current nonce for validation
+    
+    def is_authenticated(self, request_handler):
+        """
+        Check if the request is properly authenticated.
+        
+        Args:
+            request_handler: The HTTP request handler
+            
+        Returns:
+            bool: True if authenticated, False otherwise
+        """
+        if not self.auth_type:
+            return True
+        
+        if self.auth_type.lower() == 'basic':
+            return self._check_basic_auth(request_handler)
+        elif self.auth_type.lower() == 'digest':
+            return self._check_digest_auth(request_handler)
+        else:
+            logger.warning(f"Unknown authentication type: {self.auth_type}")
+            return False
+    
+    def _check_basic_auth(self, request_handler):
+        """Check Basic Authentication."""
+        auth_header = request_handler.headers.get('Authorization', '')
+        
+        if not auth_header.startswith('Basic '):
+            return False
+        
+        try:
+            # Decode the base64 encoded credentials
+            encoded_credentials = auth_header[6:]  # Remove 'Basic '
+            decoded_credentials = base64.b64decode(encoded_credentials).decode('utf-8')
+            username, password = decoded_credentials.split(':', 1)
+            
+            return username == self.username and password == self.password
+        except (ValueError, UnicodeDecodeError):
+            return False
+    
+    def _check_digest_auth(self, request_handler):
+        """Check Digest Authentication."""
+        auth_header = request_handler.headers.get('Authorization', '')
+        
+        if not auth_header.startswith('Digest '):
+            return False
+        
+        try:
+            # Parse digest auth header
+            auth_params = {}
+            for param in auth_header[7:].split(','):  # Remove 'Digest '
+                key, value = param.strip().split('=', 1)
+                auth_params[key] = value.strip('"')
+            
+            # Validate required parameters
+            required_params = ['username', 'realm', 'nonce', 'uri', 'response']
+            if not all(param in auth_params for param in required_params):
+                logger.debug(f"Missing required parameters: {required_params}")
+                return False
+            
+            # Check username and realm
+            if auth_params['username'] != self.username or auth_params['realm'] != self.realm:
+                logger.debug(f"Username or realm mismatch: {auth_params['username']} != {self.username} or {auth_params['realm']} != {self.realm}")
+                return False
+            
+            # Check if nonce is valid (either current or in store)
+            if auth_params['nonce'] != self.current_nonce and auth_params['nonce'] not in self.nonce_store:
+                logger.debug(f"Invalid nonce: {auth_params['nonce']} (current: {self.current_nonce})")
+                return False
+            
+            # Generate expected response
+            ha1 = hashlib.md5(f"{self.username}:{self.realm}:{self.password}".encode()).hexdigest()
+            ha2 = hashlib.md5(f"{request_handler.command}:{auth_params['uri']}".encode()).hexdigest()
+            
+            # Handle qop parameter if present
+            if 'qop' in auth_params and auth_params['qop'] == 'auth':
+                if 'nc' not in auth_params or 'cnonce' not in auth_params:
+                    logger.debug("Missing nc or cnonce for qop=auth")
+                    return False
+                expected_response = hashlib.md5(f"{ha1}:{auth_params['nonce']}:{auth_params['nc']}:{auth_params['cnonce']}:auth:{ha2}".encode()).hexdigest()
+            else:
+                # Simple digest without qop
+                expected_response = hashlib.md5(f"{ha1}:{auth_params['nonce']}:{ha2}".encode()).hexdigest()
+            
+            logger.debug(f"Expected response: {expected_response}")
+            logger.debug(f"Received response: {auth_params['response']}")
+            
+            return auth_params['response'] == expected_response
+        except (ValueError, KeyError) as e:
+            logger.debug(f"Digest auth parsing error: {e}")
+            return False
+    
+    def send_auth_challenge(self, request_handler):
+        """Send authentication challenge to the client."""
+        if self.auth_type.lower() == 'basic':
+            request_handler.send_response(401)
+            request_handler.send_header('WWW-Authenticate', f'Basic realm="{self.realm}"')
+            request_handler.end_headers()
+            request_handler.wfile.write(b'Authentication required')
+        elif self.auth_type.lower() == 'digest':
+            # Reuse existing nonce if it's recent, otherwise generate new one
+            now = datetime.utcnow()
+            if (self.current_nonce and 
+                self.current_nonce in self.nonce_store and 
+                (now - self.nonce_store[self.current_nonce]).seconds < 300):  # 5 minutes
+                nonce = self.current_nonce
+                logger.debug(f"Reusing existing nonce: {nonce}")
+            else:
+                # Generate a new nonce for digest auth
+                nonce = secrets.token_hex(16)
+                self.nonce_store[nonce] = now
+                self.current_nonce = nonce
+                logger.debug(f"Generated new nonce: {nonce}")
+            
+            request_handler.send_response(401)
+            request_handler.send_header('WWW-Authenticate', 
+                f'Digest realm="{self.realm}", nonce="{nonce}", algorithm=MD5')
+            request_handler.end_headers()
+            request_handler.wfile.write(b'Authentication required')
 
 
 class SSLContext:
@@ -116,6 +257,17 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests for the MJPEG stream."""
+        # Check authentication if enabled
+        if hasattr(self.server, 'auth_manager') and self.server.auth_manager:
+            logger.debug(f"Authentication check for {self.path}")
+            logger.debug(f"Authorization header: {self.headers.get('Authorization', 'None')}")
+            if not self.server.auth_manager.is_authenticated(self):
+                logger.debug("Authentication failed, sending challenge")
+                self.server.auth_manager.send_auth_challenge(self)
+                return
+            else:
+                logger.debug("Authentication successful")
+        
         if self.path == '/stream':
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
@@ -151,6 +303,18 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             protocol = "https" if hasattr(self.server, 'ssl_context') and self.server.ssl_context else "http"
             port = self.server.server_address[1]
             
+            # Check if authentication is enabled
+            auth_info = ""
+            if hasattr(self.server, 'auth_manager') and self.server.auth_manager:
+                auth_type = self.server.auth_manager.auth_type.upper()
+                auth_info = f"""
+                    <div class="info">
+                        <p><strong>Authentication:</strong> {auth_type} Auth Enabled</p>
+                        <p><strong>Username:</strong> {self.server.auth_manager.username}</p>
+                        <p><strong>Password:</strong> {self.server.auth_manager.password}</p>
+                    </div>
+                """
+            
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -162,12 +326,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     .stream {{ border: 2px solid #333; border-radius: 8px; }}
                     .info {{ background: #f0f0f0; padding: 15px; border-radius: 4px; margin-bottom: 20px; }}
                     .security-badge {{ background: #4CAF50; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; display: inline-block; margin-left: 10px; }}
+                    .auth-badge {{ background: #FF9800; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; display: inline-block; margin-left: 10px; }}
                     .warning {{ background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 10px; border-radius: 4px; margin-bottom: 15px; }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>Virtual Security Camera Stream <span class="security-badge">HTTPS</span></h1>
+                    <h1>Virtual Security Camera Stream 
+                        <span class="security-badge">HTTPS</span>
+                        {f'<span class="auth-badge">{auth_type} AUTH</span>' if hasattr(self.server, 'auth_manager') and self.server.auth_manager else ''}
+                    </h1>
                     <div class="warning">
                         <strong>Security Notice:</strong> This connection uses a self-signed certificate. 
                         Your browser may show a security warning - this is normal for development/testing purposes.
@@ -177,6 +345,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         <p><strong>Protocol:</strong> {protocol.upper()}</p>
                         <p><strong>Status:</strong> <span id="status">Connecting...</span></p>
                     </div>
+                    {auth_info}
                     <img src="/stream" alt="Camera Stream" class="stream" style="width: 100%; max-width: 640px;">
                 </div>
                 <script>
@@ -296,7 +465,7 @@ class VirtualCameraServer:
     """Main server class for the virtual security camera."""
     
     def __init__(self, https_port=8080, http_port=8081, camera_source=0, simulation_mode=False, 
-                 use_https=True, use_http=True, cert_file=None, key_file=None):
+                 use_https=True, use_http=True, cert_file=None, key_file=None, auth_type=None):
         """
         Initialize the virtual camera server.
         
@@ -309,6 +478,7 @@ class VirtualCameraServer:
             use_http: If True, start HTTP server
             cert_file: Path to SSL certificate file (auto-generated if None)
             key_file: Path to SSL private key file (auto-generated if None)
+            auth_type: Authentication type ('basic', 'digest', or None)
         """
         self.https_port = https_port
         self.http_port = http_port
@@ -316,6 +486,7 @@ class VirtualCameraServer:
         self.use_http = use_http
         self.cert_file = cert_file or 'certs/virtual_camera.crt'
         self.key_file = key_file or 'certs/virtual_camera.key'
+        self.auth_manager = AuthenticationManager(auth_type) if auth_type else None
         self.virtual_camera = VirtualCamera(camera_source, simulation_mode)
         self.https_server = None
         self.http_server = None
@@ -351,6 +522,7 @@ class VirtualCameraServer:
             if self.use_https and ssl_context:
                 self.https_server = ThreadedHTTPServer(('0.0.0.0', self.https_port), MJPEGHandler)
                 self.https_server.virtual_camera = self.virtual_camera
+                self.https_server.auth_manager = self.auth_manager
                 self.https_server.ssl_context = ssl_context
                 self.https_server.socket = ssl_context.wrap_socket(self.https_server.socket, server_side=True)
                 
@@ -366,6 +538,7 @@ class VirtualCameraServer:
             if self.use_http:
                 self.http_server = ThreadedHTTPServer(('0.0.0.0', self.http_port), MJPEGHandler)
                 self.http_server.virtual_camera = self.virtual_camera
+                self.http_server.auth_manager = self.auth_manager
                 
                 self.http_thread = threading.Thread(target=self.http_server.serve_forever)
                 self.http_thread.daemon = True
@@ -381,6 +554,11 @@ class VirtualCameraServer:
             logger.info("=" * 60)
             logger.info(f"Camera source: {self.virtual_camera.camera_source}")
             logger.info(f"Simulation mode: {self.virtual_camera.simulation_mode}")
+            
+            if self.auth_manager:
+                logger.info(f"Authentication: {self.auth_manager.auth_type.upper()} Auth Enabled")
+                logger.info(f"Username: {self.auth_manager.username}")
+                logger.info(f"Password: {self.auth_manager.password}")
             
             if self.use_https and ssl_context:
                 logger.info("Using self-signed certificate - browser may show security warning")
@@ -420,13 +598,14 @@ class VirtualCameraServer:
 
 def main():
     """Main function to run the virtual camera server."""
-    parser = argparse.ArgumentParser(description='Virtual Security Camera Server with Dual HTTP/HTTPS Support')
+    parser = argparse.ArgumentParser(description='Virtual Security Camera Server with Dual HTTP/HTTPS Support and Authentication')
     parser.add_argument('--https-port', type=int, default=8080, help='Port for HTTPS server (default: 8080)')
     parser.add_argument('--http-port', type=int, default=8081, help='Port for HTTP server (default: 8081)')
     parser.add_argument('--camera', type=str, default='0', help='Camera source: 0 for default webcam, or path to video file')
     parser.add_argument('--simulation', action='store_true', help='Run in simulation mode (generate synthetic frames)')
     parser.add_argument('--https-only', action='store_true', help='Run only HTTPS server (disable HTTP)')
     parser.add_argument('--http-only', action='store_true', help='Run only HTTP server (disable HTTPS)')
+    parser.add_argument('--auth', choices=['basic', 'digest'], help='Enable authentication (basic or digest)')
     parser.add_argument('--cert', type=str, help='Path to SSL certificate file (auto-generated if not provided)')
     parser.add_argument('--key', type=str, help='Path to SSL private key file (auto-generated if not provided)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
@@ -454,7 +633,8 @@ def main():
         use_https=use_https,
         use_http=use_http,
         cert_file=args.cert,
-        key_file=args.key
+        key_file=args.key,
+        auth_type=args.auth
     )
     
     server.start()

@@ -43,6 +43,7 @@ Options:
   --simulation        Run in simulation mode (generate synthetic frames)
   --https-only        Run only HTTPS server (disable HTTP)
   --http-only         Run only HTTP server (disable HTTPS)
+  --auth TYPE         Enable authentication (basic or digest)
   --cert FILE         Path to SSL certificate file (auto-generated if not provided)
   --key FILE          Path to SSL private key file (auto-generated if not provided)
   --verbose, -v       Enable verbose logging
@@ -91,6 +92,16 @@ python3 virtual_camera.py --cert /path/to/cert.crt --key /path/to/key.key
 python3 virtual_camera.py --cert certs/my_cert.crt --key certs/my_key.key
 ```
 
+**Enable Basic Authentication:**
+```bash
+python3 virtual_camera.py --auth basic
+```
+
+**Enable Digest Authentication:**
+```bash
+python3 virtual_camera.py --auth digest
+```
+
 **Enable verbose logging:**
 ```bash
 python3 virtual_camera.py --verbose
@@ -130,6 +141,23 @@ If you've specified different ports:
 https://localhost:[HTTPS_PORT]/
 http://localhost:[HTTP_PORT]/
 ```
+
+### Authentication
+When authentication is enabled, you'll be prompted for credentials:
+
+**Default Credentials (for testing):**
+- **Username**: `username`
+- **Password**: `password`
+
+**Basic Authentication:**
+- Credentials are sent in base64 encoding
+- Less secure but widely supported
+- Use with HTTPS for better security
+
+**Digest Authentication:**
+- Credentials are hashed before transmission
+- More secure than Basic Auth
+- Still recommended to use with HTTPS
 
 ### Integration with Other Applications
 
@@ -224,6 +252,8 @@ python3 virtual_camera.py --cert certs/my_cert.crt --key certs/my_key.key
 - The server binds to `0.0.0.0` by default, making it accessible from any network interface
 - **HTTPS is enabled by default** with self-signed certificates for secure connections
 - Self-signed certificates will trigger browser security warnings - this is normal for development/testing
+- **Authentication is available** with Basic and Digest auth for testing purposes
+- **Default credentials** (username/password) are hardcoded for testing - change for production use
 - For production use, consider using proper SSL certificates from a trusted Certificate Authority
 - The current implementation is designed for local network use and testing purposes
 
@@ -232,7 +262,3 @@ python3 virtual_camera.py --cert certs/my_cert.crt --key certs/my_key.key
 - **opencv-python**: Computer vision library for camera access and image processing
 - **numpy**: Numerical computing library (required by OpenCV)
 - **cryptography**: Library for SSL/TLS certificate generation and management
-
-## License
-
-This project is provided as-is for educational and testing purposes.
