@@ -294,6 +294,37 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     time.sleep(0.033)  # ~30 FPS
             except (ConnectionResetError, BrokenPipeError):
                 logger.info("Client disconnected from stream")
+        elif self.path == '/still.jpg':
+            # Serve a single static JPEG frame
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+            
+            try:
+                # Get a single frame from the virtual camera
+                frame = self.server.virtual_camera.get_frame()
+                if frame is not None:
+                    # Encode frame as JPEG
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ret:
+                        self.send_header('Content-Length', str(len(buffer)))
+                        self.end_headers()
+                        self.wfile.write(buffer)
+                    else:
+                        self.send_response(500)
+                        self.end_headers()
+                        self.wfile.write(b'Failed to encode frame')
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b'Failed to capture frame')
+            except Exception as e:
+                logger.error(f"Error serving still image: {e}")
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'Internal server error')
         elif self.path == '/':
             # Serve a simple HTML page to view the stream
             self.send_response(200)
@@ -342,6 +373,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     </div>
                     <div class="info">
                         <p><strong>Stream URL:</strong> <a href="/stream">{protocol}://localhost:{port}/stream</a></p>
+                        <p><strong>Still Image:</strong> <a href="/still.jpg">{protocol}://localhost:{port}/still.jpg</a></p>
                         <p><strong>Protocol:</strong> {protocol.upper()}</p>
                         <p><strong>Status:</strong> <span id="status">Connecting...</span></p>
                     </div>
@@ -532,6 +564,7 @@ class VirtualCameraServer:
                 
                 logger.info(f"HTTPS server started on port {self.https_port}")
                 logger.info(f"HTTPS Stream URL: https://localhost:{self.https_port}/stream")
+                logger.info(f"HTTPS Still Image: https://localhost:{self.https_port}/still.jpg")
                 logger.info(f"HTTPS Web interface: https://localhost:{self.https_port}/")
             
             # Start HTTP server if enabled
@@ -546,6 +579,7 @@ class VirtualCameraServer:
                 
                 logger.info(f"HTTP server started on port {self.http_port}")
                 logger.info(f"HTTP Stream URL: http://localhost:{self.http_port}/stream")
+                logger.info(f"HTTP Still Image: http://localhost:{self.http_port}/still.jpg")
                 logger.info(f"HTTP Web interface: http://localhost:{self.http_port}/")
             
             # Log server information

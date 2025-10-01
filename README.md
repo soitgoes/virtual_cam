@@ -122,6 +122,11 @@ https://localhost:8080/
 https://localhost:8080/stream
 ```
 
+**Still Image (Single Frame):**
+```
+https://localhost:8080/still.jpg
+```
+
 **Note**: Since the server uses a self-signed certificate, your browser will show a security warning. This is normal for development/testing purposes. You can safely proceed by clicking "Advanced" and then "Proceed to localhost (unsafe)" or similar option.
 
 ### HTTP Access (Default)
@@ -135,11 +140,20 @@ http://localhost:8081/
 http://localhost:8081/stream
 ```
 
+**Still Image (Single Frame):**
+```
+http://localhost:8081/still.jpg
+```
+
 ### Custom Ports
 If you've specified different ports:
 ```
 https://localhost:[HTTPS_PORT]/
+https://localhost:[HTTPS_PORT]/stream
+https://localhost:[HTTPS_PORT]/still.jpg
 http://localhost:[HTTP_PORT]/
+http://localhost:[HTTP_PORT]/stream
+http://localhost:[HTTP_PORT]/still.jpg
 ```
 
 ### Authentication
@@ -159,13 +173,34 @@ When authentication is enabled, you'll be prompted for credentials:
 - More secure than Basic Auth
 - Still recommended to use with HTTPS
 
+### Still Image Endpoint
+
+The `/still.jpg` endpoint provides a single JPEG frame instead of a continuous stream:
+
+**Use Cases:**
+- **Snapshot capture** - Get a single frame for analysis
+- **Thumbnail generation** - Create preview images
+- **API integration** - Simple HTTP GET request for current frame
+- **Testing** - Verify camera functionality without streaming
+
+**Example Usage:**
+```bash
+# Download a single frame
+curl -o snapshot.jpg http://localhost:8081/still.jpg
+
+# With authentication
+curl --digest --user username:password -o snapshot.jpg http://localhost:8081/still.jpg
+```
+
 ### Integration with Other Applications
 
-The MJPEG stream can be integrated with:
+The MJPEG stream and still image can be integrated with:
 - Security monitoring software
 - Home automation systems
 - Video recording applications
 - Web applications that need live video feeds
+- Image processing systems
+- API endpoints for mobile apps
 
 ## Technical Details
 
