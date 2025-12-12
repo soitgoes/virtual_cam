@@ -19,6 +19,8 @@ import ipaddress
 import base64
 import hashlib
 import secrets
+import io
+import struct
 from datetime import datetime, timedelta
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -252,11 +254,346 @@ class SSLContext:
             return None
 
 
+class H264Encoder:
+    """H264 encoder for video streaming using OpenCV VideoWriter."""
+    
+    def __init__(self, width=640, height=480, fps=30):
+        """
+        Initialize H264 encoder.
+        
+        Args:
+            width: Frame width
+            height: Frame height
+            fps: Frames per second
+        """
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.frame_buffer = []
+        self.max_buffer_size = fps * 2  # Keep 2 seconds of frames
+        self.lock = threading.Lock()
+        
+    def encode_frame(self, frame):
+        """
+        Prepare frame for encoding (resize if needed).
+        
+        Args:
+            frame: Input frame (numpy array)
+            
+        Returns:
+            numpy array: Prepared frame
+        """
+        try:
+            # Resize frame if needed
+            if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
+            return frame
+        except Exception as e:
+            logger.error(f"Error preparing H264 frame: {e}")
+            return None
+
+
 class MJPEGHandler(BaseHTTPRequestHandler):
-    """HTTP handler for MJPEG streaming."""
+    """HTTP handler for MJPEG and H264 streaming."""
+    
+    def _stream_mjpeg(self):
+        """Stream MJPEG video."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        self.end_headers()
+        
+        try:
+            while True:
+                # Get frame from the virtual camera
+                frame = self.server.virtual_camera.get_frame()
+                if frame is not None:
+                    # Encode frame as JPEG
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ret:
+                        # Send frame
+                        self.wfile.write(b'--frame\r\n')
+                        self.send_header('Content-Type', 'image/jpeg')
+                        self.send_header('Content-Length', str(len(buffer)))
+                        self.end_headers()
+                        self.wfile.write(buffer)
+                        self.wfile.write(b'\r\n')
+                time.sleep(0.033)  # ~30 FPS
+        except (ConnectionResetError, BrokenPipeError):
+            logger.info("Client disconnected from MJPEG stream")
+    
+    def _stream_h264(self):
+        """Stream H264 video using ffmpeg or OpenCV VideoWriter."""
+        import subprocess
+        import tempfile
+        
+        # Get frame dimensions from first frame
+        test_frame = self.server.virtual_camera.get_frame()
+        if test_frame is None:
+            logger.error("Failed to capture frame for H264 streaming")
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b'Failed to capture frame')
+            return
+        
+        height, width = test_frame.shape[:2]
+        fps = 30
+        
+        # Try to use ffmpeg first (best option for H264 streaming)
+        try:
+            # Check if ffmpeg is available
+            result = subprocess.run(['ffmpeg', '-version'], 
+                                  stdout=subprocess.DEVNULL, 
+                                  stderr=subprocess.DEVNULL, 
+                                  timeout=2)
+            use_ffmpeg = (result.returncode == 0)
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            use_ffmpeg = False
+        
+        if use_ffmpeg:
+            # Use ffmpeg for better H264 streaming
+            logger.info("Using ffmpeg for H264 encoding")
+            self._stream_h264_ffmpeg(width, height, fps)
+            return
+        
+        # Fallback to OpenCV VideoWriter
+        logger.info("ffmpeg not available, trying OpenCV VideoWriter for H264")
+        
+        # Try different H264 fourcc codes
+        fourcc_options = ['H264', 'avc1', 'X264', 'h264', 'mp4v']
+        fourcc = None
+        
+        for codec_str in fourcc_options:
+            try:
+                test_fourcc = cv2.VideoWriter_fourcc(*codec_str)
+                # Test if codec is available by trying to create a writer
+                temp_test = tempfile.NamedTemporaryFile(suffix='.mp4', delete=True)
+                test_writer = cv2.VideoWriter(temp_test.name, test_fourcc, fps, (width, height))
+                if test_writer.isOpened():
+                    fourcc = test_fourcc
+                    test_writer.release()
+                    temp_test.close()
+                    logger.info(f"Using H264 codec: {codec_str}")
+                    break
+                test_writer.release()
+                temp_test.close()
+            except Exception as e:
+                logger.debug(f"Codec {codec_str} not available: {e}")
+                continue
+        
+        if fourcc is None:
+            logger.warning("No H264 codec available, falling back to MJPEG")
+            self._stream_mjpeg()
+            return
+        
+        # Use OpenCV VideoWriter
+        self._stream_h264_opencv(width, height, fps, fourcc)
+    
+    def _stream_h264_ffmpeg(self, width, height, fps):
+        """Stream H264 using ffmpeg subprocess."""
+        import subprocess
+        
+        # FFmpeg command to encode raw video to H264 and output as raw H264 (Annex-B format)
+        # jmuxer expects raw H.264 NAL units, not MP4 container
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'bgr24',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-g', str(fps),  # Keyframe interval (1 per second for better compatibility)
+            '-keyint_min', str(fps),  # Minimum keyframe interval
+            '-sc_threshold', '0',  # Disable scene change detection for consistent keyframes
+            '-f', 'h264',  # Output raw H.264 (Annex-B format) instead of MP4
+            '-bsf:v', 'h264_mp4toannexb',  # Ensure Annex-B format (NAL units with start codes)
+            '-an',  # No audio
+            '-'  # Output to stdout
+        ]
+        
+        try:
+            # Start ffmpeg process
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Send HTTP headers
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')  # Raw H.264 stream
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+            self.end_headers()
+            
+            # Use threading to read ffmpeg output while writing frames
+            output_buffer = []
+            output_lock = threading.Lock()
+            read_done = threading.Event()
+            
+            def read_output():
+                """Read encoded data from ffmpeg stdout."""
+                try:
+                    while True:
+                        chunk = process.stdout.read(8192)
+                        if not chunk:
+                            break
+                        with output_lock:
+                            output_buffer.append(chunk)
+                except Exception as e:
+                    logger.debug(f"Error reading ffmpeg output: {e}")
+                finally:
+                    read_done.set()
+            
+            # Start reading thread
+            read_thread = threading.Thread(target=read_output, daemon=True)
+            read_thread.start()
+            
+            # Stream frames and send encoded data
+            frame_count = 0
+            while True:
+                frame = self.server.virtual_camera.get_frame()
+                if frame is not None:
+                    # Resize if needed
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        frame = cv2.resize(frame, (width, height))
+                    
+                    # Write frame to ffmpeg
+                    try:
+                        process.stdin.write(frame.tobytes())
+                        process.stdin.flush()
+                        frame_count += 1
+                    except BrokenPipeError:
+                        logger.debug("ffmpeg stdin closed")
+                        break
+                    
+                    # Send any available encoded data
+                    with output_lock:
+                        while output_buffer:
+                            chunk = output_buffer.pop(0)
+                            try:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            except (ConnectionResetError, BrokenPipeError):
+                                logger.debug("Client disconnected")
+                                return
+                
+                # Check if ffmpeg process is still alive
+                if process.poll() is not None:
+                    logger.debug("ffmpeg process ended")
+                    break
+                
+                time.sleep(1.0 / fps)
+            
+            # Flush remaining output
+            read_thread.join(timeout=2)
+            with output_lock:
+                while output_buffer:
+                    chunk = output_buffer.pop(0)
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except:
+                        pass
+                
+        except Exception as e:
+            logger.error(f"Error in H264 ffmpeg streaming: {e}")
+            if process:
+                process.terminate()
+        finally:
+            if 'process' in locals() and process:
+                process.terminate()
+                process.wait()
+    
+    def _stream_h264_opencv(self, width, height, fps, fourcc):
+        """Stream H264 using OpenCV VideoWriter (less efficient but works without ffmpeg)."""
+        import tempfile
+        import os
+        
+        # Create temporary file for VideoWriter
+        temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_file.close()
+        
+        try:
+            # Create VideoWriter
+            writer = cv2.VideoWriter(temp_file.name, fourcc, fps, (width, height))
+            
+            if not writer.isOpened():
+                logger.error("Failed to open H264 VideoWriter")
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'Failed to initialize H264 encoder')
+                return
+            
+            # Send HTTP headers for MP4 streaming
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+            self.end_headers()
+            
+            frame_count = 0
+            segment_frames = fps * 2  # Create 2-second segments
+            
+            while True:
+                frame = self.server.virtual_camera.get_frame()
+                if frame is not None:
+                    # Resize if needed
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        frame = cv2.resize(frame, (width, height))
+                    
+                    writer.write(frame)
+                    frame_count += 1
+                    
+                    # Periodically read and send encoded data
+                    if frame_count % segment_frames == 0:
+                        writer.release()
+                        
+                        # Read the encoded file
+                        if os.path.exists(temp_file.name):
+                            with open(temp_file.name, 'rb') as f:
+                                data = f.read()
+                                if data:
+                                    self.wfile.write(data)
+                                    self.wfile.flush()
+                        
+                        # Remove old file and create new one
+                        try:
+                            os.remove(temp_file.name)
+                        except:
+                            pass
+                        
+                        # Create new writer for next segment
+                        writer = cv2.VideoWriter(temp_file.name, fourcc, fps, (width, height))
+                        if not writer.isOpened():
+                            break
+                
+                time.sleep(1.0 / fps)
+                
+        except (ConnectionResetError, BrokenPipeError):
+            logger.info("Client disconnected from H264 stream")
+        except Exception as e:
+            logger.error(f"Error in H264 OpenCV streaming: {e}")
+        finally:
+            if 'writer' in locals():
+                writer.release()
+            try:
+                if os.path.exists(temp_file.name):
+                    os.remove(temp_file.name)
+            except:
+                pass
     
     def do_GET(self):
-        """Handle GET requests for the MJPEG stream."""
+        """Handle GET requests for the video stream."""
         # Check authentication if enabled
         if hasattr(self.server, 'auth_manager') and self.server.auth_manager:
             logger.debug(f"Authentication check for {self.path}")
@@ -268,32 +605,14 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             else:
                 logger.debug("Authentication successful")
         
+        # Get codec from server
+        codec = getattr(self.server, 'codec', 'mjpg').lower()
+        
         if self.path == '/stream':
-            self.send_response(200)
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Expires', '0')
-            self.end_headers()
-            
-            try:
-                while True:
-                    # Get frame from the virtual camera
-                    frame = self.server.virtual_camera.get_frame()
-                    if frame is not None:
-                        # Encode frame as JPEG
-                        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        if ret:
-                            # Send frame
-                            self.wfile.write(b'--frame\r\n')
-                            self.send_header('Content-Type', 'image/jpeg')
-                            self.send_header('Content-Length', str(len(buffer)))
-                            self.end_headers()
-                            self.wfile.write(buffer)
-                            self.wfile.write(b'\r\n')
-                    time.sleep(0.033)  # ~30 FPS
-            except (ConnectionResetError, BrokenPipeError):
-                logger.info("Client disconnected from stream")
+            if codec == 'h264':
+                self._stream_h264()
+            else:
+                self._stream_mjpeg()
         elif self.path == '/still.jpg':
             # Serve a single static JPEG frame
             self.send_response(200)
@@ -334,6 +653,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             protocol = "https" if hasattr(self.server, 'ssl_context') and self.server.ssl_context else "http"
             port = self.server.server_address[1]
             
+            # Get codec from server
+            codec = getattr(self.server, 'codec', 'mjpg').lower()
+            codec_display = codec.upper()
+            
             # Check if authentication is enabled
             auth_info = ""
             if hasattr(self.server, 'auth_manager') and self.server.auth_manager:
@@ -344,6 +667,28 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         <p><strong>Username:</strong> {self.server.auth_manager.username}</p>
                         <p><strong>Password:</strong> {self.server.auth_manager.password}</p>
                     </div>
+                """
+            
+            # Generate HTML based on codec
+            if codec == 'h264':
+                stream_element = f'<video id="stream" src="/stream" autoplay muted playsinline class="stream" style="width: 100%; max-width: 640px;"></video>'
+                stream_script = """
+                    const video = document.getElementById('stream');
+                    const status = document.getElementById('status');
+                    
+                    video.onloadedmetadata = () => status.textContent = 'Connected';
+                    video.onplay = () => status.textContent = 'Playing';
+                    video.onerror = () => status.textContent = 'Connection Error';
+                    video.onstalled = () => status.textContent = 'Buffering...';
+                """
+            else:
+                stream_element = '<img id="stream" src="/stream" alt="Camera Stream" class="stream" style="width: 100%; max-width: 640px;">'
+                stream_script = """
+                    const img = document.getElementById('stream');
+                    const status = document.getElementById('status');
+                    
+                    img.onload = () => status.textContent = 'Connected';
+                    img.onerror = () => status.textContent = 'Connection Error';
                 """
             
             html = f"""
@@ -358,6 +703,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     .info {{ background: #f0f0f0; padding: 15px; border-radius: 4px; margin-bottom: 20px; }}
                     .security-badge {{ background: #4CAF50; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; display: inline-block; margin-left: 10px; }}
                     .auth-badge {{ background: #FF9800; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; display: inline-block; margin-left: 10px; }}
+                    .codec-badge {{ background: #2196F3; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; display: inline-block; margin-left: 10px; }}
                     .warning {{ background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 10px; border-radius: 4px; margin-bottom: 15px; }}
                 </style>
             </head>
@@ -365,6 +711,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 <div class="container">
                     <h1>Virtual Security Camera Stream 
                         <span class="security-badge">HTTPS</span>
+                        <span class="codec-badge">{codec_display}</span>
                         {f'<span class="auth-badge">{auth_type} AUTH</span>' if hasattr(self.server, 'auth_manager') and self.server.auth_manager else ''}
                     </h1>
                     <div class="warning">
@@ -375,17 +722,14 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         <p><strong>Stream URL:</strong> <a href="/stream">{protocol}://localhost:{port}/stream</a></p>
                         <p><strong>Still Image:</strong> <a href="/still.jpg">{protocol}://localhost:{port}/still.jpg</a></p>
                         <p><strong>Protocol:</strong> {protocol.upper()}</p>
+                        <p><strong>Codec:</strong> {codec_display}</p>
                         <p><strong>Status:</strong> <span id="status">Connecting...</span></p>
                     </div>
                     {auth_info}
-                    <img src="/stream" alt="Camera Stream" class="stream" style="width: 100%; max-width: 640px;">
+                    {stream_element}
                 </div>
                 <script>
-                    const img = document.querySelector('img');
-                    const status = document.getElementById('status');
-                    
-                    img.onload = () => status.textContent = 'Connected';
-                    img.onerror = () => status.textContent = 'Connection Error';
+                    {stream_script}
                 </script>
             </body>
             </html>
@@ -497,7 +841,7 @@ class VirtualCameraServer:
     """Main server class for the virtual security camera."""
     
     def __init__(self, https_port=8080, http_port=8081, camera_source=0, simulation_mode=False, 
-                 use_https=True, use_http=True, cert_file=None, key_file=None, auth_type=None):
+                 use_https=True, use_http=True, cert_file=None, key_file=None, auth_type=None, codec='mjpg'):
         """
         Initialize the virtual camera server.
         
@@ -511,6 +855,7 @@ class VirtualCameraServer:
             cert_file: Path to SSL certificate file (auto-generated if None)
             key_file: Path to SSL private key file (auto-generated if None)
             auth_type: Authentication type ('basic', 'digest', or None)
+            codec: Video codec ('mjpg' or 'h264', default: 'mjpg')
         """
         self.https_port = https_port
         self.http_port = http_port
@@ -520,6 +865,7 @@ class VirtualCameraServer:
         self.key_file = key_file or 'certs/virtual_camera.key'
         self.auth_manager = AuthenticationManager(auth_type) if auth_type else None
         self.virtual_camera = VirtualCamera(camera_source, simulation_mode)
+        self.codec = codec.lower()
         self.https_server = None
         self.http_server = None
         self.https_thread = None
@@ -555,6 +901,7 @@ class VirtualCameraServer:
                 self.https_server = ThreadedHTTPServer(('0.0.0.0', self.https_port), MJPEGHandler)
                 self.https_server.virtual_camera = self.virtual_camera
                 self.https_server.auth_manager = self.auth_manager
+                self.https_server.codec = self.codec
                 self.https_server.ssl_context = ssl_context
                 self.https_server.socket = ssl_context.wrap_socket(self.https_server.socket, server_side=True)
                 
@@ -566,12 +913,14 @@ class VirtualCameraServer:
                 logger.info(f"HTTPS Stream URL: https://localhost:{self.https_port}/stream")
                 logger.info(f"HTTPS Still Image: https://localhost:{self.https_port}/still.jpg")
                 logger.info(f"HTTPS Web interface: https://localhost:{self.https_port}/")
+                logger.info(f"Codec: {self.codec.upper()}")
             
             # Start HTTP server if enabled
             if self.use_http:
                 self.http_server = ThreadedHTTPServer(('0.0.0.0', self.http_port), MJPEGHandler)
                 self.http_server.virtual_camera = self.virtual_camera
                 self.http_server.auth_manager = self.auth_manager
+                self.http_server.codec = self.codec
                 
                 self.http_thread = threading.Thread(target=self.http_server.serve_forever)
                 self.http_thread.daemon = True
@@ -642,6 +991,7 @@ def main():
     parser.add_argument('--auth', choices=['basic', 'digest'], help='Enable authentication (basic or digest)')
     parser.add_argument('--cert', type=str, help='Path to SSL certificate file (auto-generated if not provided)')
     parser.add_argument('--key', type=str, help='Path to SSL private key file (auto-generated if not provided)')
+    parser.add_argument('--codec', choices=['mjpg', 'h264'], default='mjpg', help='Video codec: mjpg or h264 (default: mjpg)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     
     args = parser.parse_args()
@@ -668,7 +1018,8 @@ def main():
         use_http=use_http,
         cert_file=args.cert,
         key_file=args.key,
-        auth_type=args.auth
+        auth_type=args.auth,
+        codec=args.codec
     )
     
     server.start()
